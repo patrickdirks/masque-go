@@ -13,6 +13,7 @@ import (
 
 	"github.com/quic-go/masque-go"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/yosida95/uritemplate/v3"
 )
@@ -55,6 +56,10 @@ func main() {
 		TLSConfig:       tlsConf,
 		EnableDatagrams: true, // Crucial for MASQUE
 		Logger:          slog.Default(),
+		QUICConfig: &quic.Config{
+			EnableDatagrams:   true,
+			InitialPacketSize: 1500,
+		},
 	}
 	defer server.Close()
 

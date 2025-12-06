@@ -165,9 +165,10 @@ start:
 		layer = unix.IPPROTO_IP
 		typeVal = unix.IP_TOS
 	}
-
+	print(contextID)
 	// Map ContextID to ECN value
 	tosByte := byte(contextID & 0x03) // Safety mask, assuming ID maps directly to ECN
+	//print(tosByte)
 
 	// ---------------------------------------------------------
 	// 2. Write to the EXISTING oob slice (Do not use make!)
@@ -188,6 +189,7 @@ start:
 
 		// Write the single byte of TOS data
 		*(*byte)(unsafe.Pointer(dataPtr)) = tosByte
+		print("T")
 
 		oobn = reqLen
 	}

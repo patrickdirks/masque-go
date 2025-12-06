@@ -36,7 +36,7 @@ func main() {
 	cl := masque.Client{
 		QUICConfig: &quic.Config{
 			EnableDatagrams:   true,
-			InitialPacketSize: 1350,
+			InitialPacketSize: 1400,
 		},
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -66,7 +66,7 @@ func main() {
 				quicConf.DisablePathMTUDiscovery = true
 				tlsConf.InsecureSkipVerify = true
 				tlsConf.KeyLogWriter = kl
-				
+
 				return quic.DialEarly(ctx, pconn, raddr, tlsConf, quicConf)
 			},
 		},
