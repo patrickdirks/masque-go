@@ -87,6 +87,7 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 			return
 		}
 		tlsConf := c.TLSClientConfig
+	
 		if tlsConf == nil {
 			tlsConf = &tls.Config{NextProtos: []string{http3.NextProtoH3}}
 		}

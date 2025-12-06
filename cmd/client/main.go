@@ -32,11 +32,16 @@ func main() {
 	if len(urls) != 1 {
 		log.Fatal("usage: client -t <template> <url>")
 	}
-
+	kl, _ := os.OpenFile("key.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	cl := masque.Client{
 		QUICConfig: &quic.Config{
 			EnableDatagrams:   true,
 			InitialPacketSize: 1350,
+		},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h3"},
+			KeyLogWriter:       kl,
 		},
 	}
 	host, port, err := extractHostAndPort(urls[0])
@@ -51,6 +56,7 @@ func main() {
 				if err != nil {
 					return nil, err
 				}
+
 				pconn, _, err := cl.Dial(context.Background(), uritemplate.MustNew(proxyURITemplate), raddr)
 				if err != nil {
 					log.Fatal("dialing MASQUE failed:", err)
@@ -58,6 +64,9 @@ func main() {
 				log.Printf("dialed connection: %s <-> %s", pconn.LocalAddr(), raddr)
 				quicConf = quicConf.Clone()
 				quicConf.DisablePathMTUDiscovery = true
+				tlsConf.InsecureSkipVerify = true
+				tlsConf.KeyLogWriter = kl
+				
 				return quic.DialEarly(ctx, pconn, raddr, tlsConf, quicConf)
 			},
 		},

@@ -7,12 +7,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
+	"unsafe"
 
 	"github.com/dunglas/httpsfv"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -35,6 +38,7 @@ func (e proxyEntry) Close() error {
 }
 
 // A Proxy is an RFC 9298 CONNECT-UDP proxy.
+
 type Proxy struct {
 	mx       sync.Mutex
 	closed   bool
@@ -83,6 +87,7 @@ func dnsErrorToProxyStatus(proxyStatus *httpsfv.Item, dnsError *net.DNSError) {
 // For more control over the UDP socket, use ProxyConnectedSocket.
 // Applications may add custom header fields to the response header,
 // but MUST NOT call WriteHeader on the http.ResponseWriter.
+
 func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
 	s.mx.Lock()
 	if s.closed {
@@ -120,6 +125,7 @@ func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
 	proxyStatus.Params.Add("next-hop", addr.String())
 
 	conn, err := net.DialUDP("udp", nil, addr)
+
 	if err != nil {
 		proxyStatus.Params.Add("error", "destination_ip_unroutable")
 		err = writeProxyStatus(err)
@@ -139,6 +145,7 @@ func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
 // Applications may add custom header fields such as Proxy-Status
 // to the response header, but MUST NOT call WriteHeader on the
 // http.ResponseWriter. It closes the connection before returning.
+
 func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *net.UDPConn) error {
 	s.mx.Lock()
 	if s.closed {
@@ -210,7 +217,9 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 		if err != nil {
 			return err
 		}
-		if contextID != 0 {
+		print("\nSend:")
+		print("Send:" + strconv.Itoa(int(contextID)) + "\n")
+		if contextID > 3 {
 			// Drop this datagram. We currently only support proxying of UDP payloads.
 			continue
 		}
@@ -218,13 +227,36 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 			log.Printf("dropping datagram larger than MTU (%d > %d)", len(data[n:]), maxUDPPayloadSize)
 			continue
 		}
-		if _, err := conn.Write(data[n:]); err != nil {
-			return err
+		var layer int
+		var typeVal int
+
+		tosByte := contextID & 0x03
+		oob := make([]byte, unix.CmsgSpace(4))
+		//if _, err := conn.Write(data[n:]); err != nil {
+		addr := conn.LocalAddr().(*net.UDPAddr)
+		if addr.IP.To4() != nil {
+			// IPv4
+			layer = unix.IPPROTO_IP
+			typeVal = unix.IP_TOS // Or IP_RECVTOS depending on platform, usually IP_TOS for sending
+		} else {
+			// IPv6
+			layer = unix.IPPROTO_IPV6
+			typeVal = unix.IPV6_TCLASS
 		}
+		cmsghdr := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
+		cmsghdr.Level = int32(layer)
+		cmsghdr.Type = int32(typeVal)
+		cmsghdr.SetLen(unix.CmsgLen(4))
+		dataPtr := uintptr(unsafe.Pointer(&oob[0])) + uintptr(unix.CmsgLen(0))
+		*(*uint32)(unsafe.Pointer(dataPtr)) = uint32(tosByte)
+
+		// 6. Send the message
+		_, _, _ = conn.WriteMsgUDP(data[n:], oob, nil)
 	}
 }
 
 func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
+	print("Rec")
 	b := make([]byte, len(contextIDZero)+maxUDPPayloadSize+1)
 	copy(b, contextIDZero)
 	for {
@@ -239,6 +271,7 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 			log.Printf("dropping UDP packet larger than MTU")
 			continue
 		}
+		print("P1")
 		if err := str.SendDatagram(b[:len(contextIDZero)+n]); err != nil {
 			return err
 		}
@@ -246,6 +279,7 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 }
 
 // Close closes the proxy, immediately terminating all proxied flows.
+
 func (s *Proxy) Close() error {
 	s.mx.Lock()
 	s.closed = true
