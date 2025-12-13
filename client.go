@@ -41,7 +41,7 @@ type Client struct {
 // DialAddr dials a proxied connection to a target server.
 // The target address is sent to the proxy, and the DNS resolution is left to the proxy.
 // The target must be given as a host:port.
-func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Template, target string) (net.PacketConn, *http.Response, error) {
+func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Template, target string, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse target: %w", err)
@@ -53,11 +53,11 @@ func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Templa
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
 	}
-	return c.dial(ctx, str, masqueAddr{target})
+	return c.dial(ctx, str, masqueAddr{target}, ecnConfig)
 }
 
 // Dial dials a proxied connection to a target server.
-func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr) (net.PacketConn, *http.Response, error) {
+func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
 	str, err := proxyTemplate.Expand(uritemplate.Values{
 		uriTemplateTargetHost: uritemplate.String(escape(raddr.IP.String())),
 		uriTemplateTargetPort: uritemplate.String(strconv.Itoa(raddr.Port)),
@@ -65,10 +65,11 @@ func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
 	}
-	return c.dial(ctx, str, raddr)
+	return c.dial(ctx, str, raddr, ecnConfig)
 }
 
-func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Addr) (net.PacketConn, *http.Response, error) {
+func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Addr, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
+
 	u, err := url.Parse(expandedTemplate)
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to parse URI: %w", err)
@@ -87,7 +88,7 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 			return
 		}
 		tlsConf := c.TLSClientConfig
-	
+
 		if tlsConf == nil {
 			tlsConf = &tls.Config{NextProtos: []string{http3.NextProtoH3}}
 		}
@@ -122,11 +123,24 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to open request stream: %w", err)
 	}
+	var httpHeader http.Header
+	if ecnConfig.Enabled {
+		ecnHeaderValue := fmt.Sprintf("?1; ect1=%d; ect0=%d; ce=%d", ecnConfig.ContextIdECT1, ecnConfig.ContextIdECT0, ecnConfig.ContextIdCE)
+		httpHeader = http.Header{
+			http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue},
+			"Proxy-ECN":                 []string{ecnHeaderValue},
+		}
+	} else {
+		httpHeader = http.Header{
+			http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue},
+		}
+	}
+
 	if err := rstr.SendRequestHeader(&http.Request{
 		Method: http.MethodConnect,
 		Proto:  requestProtocol,
 		Host:   u.Host,
-		Header: http.Header{http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue}},
+		Header: httpHeader,
 		URL:    u,
 	}); err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to send request: %w", err)
@@ -145,8 +159,18 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 			raddr = udpAddr
 		}
 	}
+	print("Proxy-ECN Header from server:")
+	print(rsp.Header.Get("Proxy-ECN"))
+	print("\n")
 
-	return newProxiedConn(rstr, masqueAddr{c.conn.LocalAddr().String()}, raddr), rsp, nil
+	if rsp.Header.Get("Proxy-ECN") == "?1" && ecnConfig.Enabled {
+		ecnConfig.Enabled = true
+	} else {
+		print("Proxy-ECN not enabled by server")
+		ecnConfig.Enabled = false
+	}
+
+	return newProxiedConn(rstr, masqueAddr{c.conn.LocalAddr().String()}, raddr, ecnConfig), rsp, nil
 }
 
 // Extract the Proxy-Status next-hop value as a UDPAddr.

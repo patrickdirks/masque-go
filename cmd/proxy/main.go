@@ -83,7 +83,7 @@ func main() {
 
 	http.HandleFunc(handlerPath, func(w http.ResponseWriter, r *http.Request) {
 		// masque.ParseRequest uses the full template to validate the request
-		req, err := masque.ParseRequest(r, template)
+		req, ecnConfig, err := masque.ParseRequest(r, template)
 		if err != nil {
 			var perr *masque.RequestParseError
 			if errors.As(err, &perr) {
@@ -93,7 +93,7 @@ func main() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		proxy.Proxy(w, req)
+		proxy.Proxy(w, req, ecnConfig)
 	})
 
 	if err := server.ListenAndServe(); err != nil {

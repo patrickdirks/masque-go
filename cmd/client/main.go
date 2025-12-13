@@ -32,6 +32,14 @@ func main() {
 	if len(urls) != 1 {
 		log.Fatal("usage: client -t <template> <url>")
 	}
+
+	ecnConfig := masque.ECNState{
+		Enabled:       false,
+		ContextIdECT0: 8,
+		ContextIdECT1: 4,
+		ContextIdCE:   6,
+	}
+
 	kl, _ := os.OpenFile("key.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	cl := masque.Client{
 		QUICConfig: &quic.Config{
@@ -57,7 +65,7 @@ func main() {
 					return nil, err
 				}
 
-				pconn, _, err := cl.Dial(context.Background(), uritemplate.MustNew(proxyURITemplate), raddr)
+				pconn, _, err := cl.Dial(context.Background(), uritemplate.MustNew(proxyURITemplate), raddr, ecnConfig)
 				if err != nil {
 					log.Fatal("dialing MASQUE failed:", err)
 				}
@@ -71,6 +79,7 @@ func main() {
 			},
 		},
 	}
+
 	rsp, err := hcl.Get(urls[0])
 	if err != nil {
 		log.Fatalf("request failed: %v", err)

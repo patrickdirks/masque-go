@@ -25,10 +25,6 @@ const (
 const maxUDPPayloadSize = 1500
 
 var contextIDZero = quicvarint.Append([]byte{}, 0)
-var cIDZero uint64 = 0
-var contextIDECT1 uint64 = 1
-var contextIDECT0 uint64 = 2
-var contextIDCE uint64 = 3
 
 type proxyEntry struct {
 	str  *http3.Stream
@@ -43,10 +39,11 @@ func (e proxyEntry) Close() error {
 // A Proxy is an RFC 9298 CONNECT-UDP proxy.
 
 type Proxy struct {
-	mx       sync.Mutex
-	closed   bool
-	refCount sync.WaitGroup // counter for the Go routines spawned in Upgrade
-	closers  map[io.Closer]struct{}
+	mx        sync.Mutex
+	closed    bool
+	refCount  sync.WaitGroup // counter for the Go routines spawned in Upgrade
+	closers   map[io.Closer]struct{}
+	ecnConfig ECNState
 }
 
 func errToStatus(err error) int {
@@ -91,7 +88,7 @@ func dnsErrorToProxyStatus(proxyStatus *httpsfv.Item, dnsError *net.DNSError) {
 // Applications may add custom header fields to the response header,
 // but MUST NOT call WriteHeader on the http.ResponseWriter.
 
-func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
+func (s *Proxy) Proxy(w http.ResponseWriter, r *Request, ecnConfig ECNState) error {
 	s.mx.Lock()
 	if s.closed {
 		s.mx.Unlock()
@@ -99,7 +96,7 @@ func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
 		return net.ErrClosed
 	}
 	s.mx.Unlock()
-
+	s.ecnConfig = ecnConfig
 	proxyStatus := httpsfv.NewItem(r.Host)
 	// Adds the proxy status to the header.  Returns
 	// the input error, or a new one if serialization fails.
@@ -112,6 +109,9 @@ func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
 			return marshalErr
 		}
 		w.Header().Add("Proxy-Status", proxyStatusVal)
+		if s.ecnConfig.Enabled {
+			w.Header().Set("Proxy-ECN", "?1")
+		}
 		return err
 	}
 
@@ -220,21 +220,27 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 		if err != nil {
 			return err
 		}
-
 		//Map Context-ID to ECN-bits, drop invalid IDs
 		tosByte := 0
-		switch contextID {
-		case 0:
-			tosByte = 0
-		case contextIDECT0:
-			tosByte = 2
-		case contextIDECT1:
-			tosByte = 1
-		case contextIDCE:
-			tosByte = 3
-		default:
-			log.Printf("dropping data using invalid ContextID (%d)", contextID)
-			continue
+		if s.ecnConfig.Enabled {
+			switch contextID {
+			case 0:
+				tosByte = 0
+			case s.ecnConfig.ContextIdECT1:
+				tosByte = 2
+			case s.ecnConfig.ContextIdECT0:
+				tosByte = 1
+			case s.ecnConfig.ContextIdCE:
+				tosByte = 3
+			default:
+				log.Printf("dropping data using invalid ContextID (%d)", contextID)
+				continue
+			}
+		} else {
+			if contextID != 0 {
+				log.Printf("dropping data using invalid ContextID (%d) when ECN is disabled", contextID)
+				continue
+			}
 		}
 		if len(data[n:]) > maxUDPPayloadSize {
 			log.Printf("dropping datagram larger than MTU (%d > %d)", len(data[n:]), maxUDPPayloadSize)
@@ -337,15 +343,17 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 
 		//Map ECN <-> ContextID
 		var contextId uint64 = 0
-		switch ecn {
-		case 0:
-			contextId = cIDZero
-		case 1:
-			contextId = contextIDECT1
-		case 2:
-			contextId = contextIDECT0
-		case 3:
-			contextId = contextIDCE
+		if s.ecnConfig.Enabled {
+			switch ecn {
+			case 0:
+				contextId = 0
+			case 1:
+				contextId = s.ecnConfig.ContextIdECT1
+			case 2:
+				contextId = s.ecnConfig.ContextIdECT0
+			case 3:
+				contextId = s.ecnConfig.ContextIdCE
+			}
 		}
 		//Convert Contect ID to Quic Variable Length Encoding
 		cID := quicvarint.Append([]byte{}, contextId)

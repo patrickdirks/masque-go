@@ -33,6 +33,13 @@ type http3Stream interface {
 	CancelRead(quic.StreamErrorCode)
 }
 
+type ECNState struct {
+	Enabled       bool
+	ContextIdECT0 uint64
+	ContextIdECT1 uint64
+	ContextIdCE   uint64
+}
+
 var (
 	_ http3Stream = &http3.Stream{}
 	_ http3Stream = &http3.RequestStream{}
@@ -42,6 +49,7 @@ type proxiedConn struct {
 	str        http3Stream
 	localAddr  net.Addr
 	remoteAddr net.Addr
+	ecn        ECNState
 
 	closed   atomic.Bool // set when Close is called
 	readDone chan struct{}
@@ -55,12 +63,13 @@ type proxiedConn struct {
 
 var _ net.PacketConn = &proxiedConn{}
 
-func newProxiedConn(str http3Stream, local, remote net.Addr) *proxiedConn {
+func newProxiedConn(str http3Stream, local, remote net.Addr, ecn ECNState) *proxiedConn {
 	c := &proxiedConn{
 		str:        str,
 		localAddr:  local,
 		remoteAddr: remote,
 		readDone:   make(chan struct{}),
+		ecn:        ecn,
 	}
 	c.readCtx, c.readCtxCancel = context.WithCancel(context.Background())
 	go func() {
@@ -163,17 +172,23 @@ start:
 
 	//Map ContextID <-> ECN
 	tosByte := byte(0)
-
-	switch contextID {
-	case cIDZero:
-		tosByte = byte(0)
-	case contextIDECT1:
-		tosByte = byte(1)
-	case contextIDECT0:
-		tosByte = byte(2)
-	case contextIDCE:
-		tosByte = byte(3)
-
+	if c.ecn.Enabled {
+		switch contextID {
+		case 0:
+			tosByte = byte(0)
+		case c.ecn.ContextIdECT1:
+			tosByte = byte(1)
+		case c.ecn.ContextIdECT0:
+			tosByte = byte(2)
+		case c.ecn.ContextIdCE:
+			tosByte = byte(3)
+		default:
+			goto start
+		}
+	} else {
+		if contextID != 0 {
+			goto start
+		}
 	}
 
 	//Write tosByte into provided oob
@@ -219,15 +234,17 @@ func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err e
 
 	//Map ECN <-> ContextID
 	var contextId uint64 = 0
-	switch ecn {
-	case 0:
-		contextId = cIDZero
-	case 1:
-		contextId = contextIDECT1
-	case 2:
-		contextId = contextIDECT0
-	case 3:
-		contextId = contextIDCE
+	if c.ecn.Enabled {
+		switch ecn {
+		case 0:
+			contextId = 0
+		case 1:
+			contextId = c.ecn.ContextIdECT1
+		case 2:
+			contextId = c.ecn.ContextIdECT0
+		case 3:
+			contextId = c.ecn.ContextIdCE
+		}
 	}
 	cId := quicvarint.Append([]byte{}, contextId)
 
