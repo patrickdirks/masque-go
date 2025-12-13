@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"sync"
 	"unsafe"
 
@@ -26,6 +25,10 @@ const (
 const maxUDPPayloadSize = 1500
 
 var contextIDZero = quicvarint.Append([]byte{}, 0)
+var cIDZero uint64 = 0
+var contextIDECT1 uint64 = 1
+var contextIDECT0 uint64 = 2
+var contextIDCE uint64 = 3
 
 type proxyEntry struct {
 	str  *http3.Stream
@@ -217,31 +220,44 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 		if err != nil {
 			return err
 		}
-		print("Send:" + strconv.Itoa(int(contextID)) + "\n")
-		if contextID > 3 {
-			// Drop this datagram. We currently only support proxying of UDP payloads.
+
+		//Map Context-ID to ECN-bits, drop invalid IDs
+		tosByte := 0
+		switch contextID {
+		case 0:
+			tosByte = 0
+		case contextIDECT0:
+			tosByte = 2
+		case contextIDECT1:
+			tosByte = 1
+		case contextIDCE:
+			tosByte = 3
+		default:
+			log.Printf("dropping data using invalid ContextID (%d)", contextID)
 			continue
 		}
 		if len(data[n:]) > maxUDPPayloadSize {
 			log.Printf("dropping datagram larger than MTU (%d > %d)", len(data[n:]), maxUDPPayloadSize)
 			continue
 		}
+
+		// Prepare oob to write the ECN bytes
 		var layer int
 		var typeVal int
-
-		tosByte := contextID & 0x03
 		oob := make([]byte, unix.CmsgSpace(4))
-		//if _, err := conn.Write(data[n:]); err != nil {
+
+		//Check if connection is using IPv4 or IPv6
 		addr := conn.LocalAddr().(*net.UDPAddr)
 		if addr.IP.To4() != nil {
 			// IPv4
 			layer = unix.IPPROTO_IP
-			typeVal = unix.IP_TOS // Or IP_RECVTOS depending on platform, usually IP_TOS for sending
+			typeVal = unix.IP_TOS
 		} else {
 			// IPv6
 			layer = unix.IPPROTO_IPV6
 			typeVal = unix.IPV6_TCLASS
 		}
+
 		cmsghdr := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
 		cmsghdr.Level = int32(layer)
 		cmsghdr.Type = int32(typeVal)
@@ -249,82 +265,25 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 		dataPtr := uintptr(unsafe.Pointer(&oob[0])) + uintptr(unix.CmsgLen(0))
 		*(*uint32)(unsafe.Pointer(dataPtr)) = uint32(tosByte)
 
-		// 6. Send the message
-		_, _, _ = conn.WriteMsgUDP(data[n:], oob, nil)
+		// Send the message using WriteMsqUDP
+		if _, _, err := conn.WriteMsgUDP(data[n:], oob, nil); err != nil {
+			log.Printf("masque: failed to send message (%v)", err)
+		}
 	}
 }
 
-/*
-	func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
-		print("Rec")
-
-		// 1 byte for Context ID + Max UDP Payload
-		b := make([]byte, 1+maxUDPPayloadSize)
-
-		// OOB buffer
-		var oobBuf [128]byte
-
-		for {
-			// Read into b[1:] to leave space for the ECN byte at b[0]
-			n, oobn, _, _, err := conn.ReadMsgUDP(b[1:], oobBuf[:])
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					return nil
-				}
-				return err
-			}
-
-			if n > maxUDPPayloadSize {
-				log.Printf("dropping UDP packet larger than MTU")
-				continue
-			}
-
-			// --- Extract ECN using 'unix' package ---
-			ecn := 0
-			// Parse the raw OOB bytes
-			if oobn > 0 {
-				print("W")
-				// Manually parse OOB data to extract ECN
-				oob := oobBuf[:oobn]
-				msgs, _ := unix.ParseSocketControlMessage(oob)
-				for _, msg := range msgs {
-					print("Y")
-					if (msg.Header.Level == unix.IPPROTO_IP && msg.Header.Type == unix.IP_TOS) ||
-						(msg.Header.Level == unix.IPPROTO_IPV6 && msg.Header.Type == unix.IPV6_TCLASS) {
-						print("Z")
-						if len(msg.Data) > 0 {
-							print("X")
-							ecn = int(msg.Data[0]) & 0x03
-						}
-					}
-				}
-			}
-
-			print("P1")
-
-			// --- Set Context ID ---
-			b[0] = byte(2)
-			print("\nECN")
-			print(ecn)
-			print("\n")
-			if err := str.SendDatagram(b[:1+n]); err != nil {
-				return err
-			}
-		}
-	}
-*/
 func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
-	// [FIX] Enable ECN reading via SyscallConn.
-	// golang.org/x/net/ipv4 does not expose a FlagTOS constant, so we use low-level setsockopt.
+	// Enable ECN reading via SyscallConn.
+	// TODO: Verify Linux support, currently only tested on MacOS
 	if sc, err := conn.SyscallConn(); err == nil {
 		sc.Control(func(fd uintptr) {
-			// IPv4: IP_RECVTOS (receive Type of Service / ECN)
+			// IPv4
 			if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVTOS, 1); err != nil {
 				log.Printf("masque: warning: failed to enable IPv4 ECN: %v", err)
 			}
-			// IPv6: IPV6_RECVTCLASS (receive Traffic Class / ECN)
+			// IPv6
 			if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVTCLASS, 1); err != nil {
-				// Ignore EINVAL (invalid argument), which happens if the socket is IPv4-only.
+				// Ignore EINVAL (invalid argument) if the socket is IPv4-only.
 				if !errors.Is(err, unix.EINVAL) {
 					log.Printf("masque: warning: failed to enable IPv6 ECN: %v", err)
 				}
@@ -333,17 +292,14 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 	} else {
 		log.Printf("masque: warning: failed to get SyscallConn to enable ECN: %v", err)
 	}
+	// Buffer for message
+	b := make([]byte, maxUDPPayloadSize)
 
-	// 1 byte for Context ID + Max UDP Payload
-	// Ensure maxUDPPayloadSize is defined in your package (usually 1200-1500)
-	b := make([]byte, 1+maxUDPPayloadSize)
-
-	// OOB buffer to read ECN bits from the kernel
+	// Buffer for OOB
 	var oobBuf [128]byte
 
 	for {
-		// Read into b[1:] to leave space for the Context ID at b[0]
-		n, oobn, _, _, err := conn.ReadMsgUDP(b[1:], oobBuf[:])
+		n, oobn, _, _, err := conn.ReadMsgUDP(b[:], oobBuf[:])
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -356,15 +312,13 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 			continue
 		}
 
-		// --- Extract ECN ---
-		ecn := 0 // Default to 0 (Not-ECT) if no OOB data is found
+		ecn := 0
 
 		if oobn > 0 {
 			// Parse the raw OOB bytes
 			msgs, _ := unix.ParseSocketControlMessage(oobBuf[:oobn])
 			for _, msg := range msgs {
-				// [FIX] Check for multiple OOB types to support both Linux and macOS/BSD.
-				// macOS returns type IP_RECVTOS (3) whereas Linux returns IP_TOS (1).
+				// macOS returns type IP_RECVTOS (3) whereas Linux returns IP_TOS (1) -> TODO: Check for better way
 				isIPv4TOS := msg.Header.Level == unix.IPPROTO_IP &&
 					(msg.Header.Type == unix.IP_TOS || msg.Header.Type == unix.IP_RECVTOS)
 
@@ -373,20 +327,32 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 
 				if isIPv4TOS || isIPv6TClass {
 					if len(msg.Data) > 0 {
-						// Extract ECN (last 2 bits of the TOS byte)
+						// Extract ECN
 						ecn = int(msg.Data[0]) & 0x03
-						break // Found it, no need to check other messages
+						break
 					}
 				}
 			}
 		}
 
-		// --- Set Context ID ---
-		// Map ECN (0-3) directly to Masque Context ID (0-3)
-		b[0] = byte(ecn)
-
-		// Send the Datagram: [Context ID] + [Payload]
-		if err := str.SendDatagram(b[:1+n]); err != nil {
+		//Map ECN <-> ContextID
+		var contextId uint64 = 0
+		switch ecn {
+		case 0:
+			contextId = cIDZero
+		case 1:
+			contextId = contextIDECT1
+		case 2:
+			contextId = contextIDECT0
+		case 3:
+			contextId = contextIDCE
+		}
+		//Convert Contect ID to Quic Variable Length Encoding
+		cID := quicvarint.Append([]byte{}, contextId)
+		//Prepend ContextID
+		m := append(cID, b...)
+		// Send the Datagram
+		if err := str.SendDatagram(m[:len(cID)+n]); err != nil {
 			return err
 		}
 	}

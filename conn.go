@@ -10,7 +10,6 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -74,8 +73,8 @@ func newProxiedConn(str http3Stream, local, remote net.Addr) *proxiedConn {
 	return c
 }
 
+// Old Read
 func (c *proxiedConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	print("OldRead\n")
 start:
 
 	c.deadlineMx.Lock()
@@ -109,9 +108,7 @@ start:
 	return copy(b, data[n:]), c.remoteAddr, nil
 }
 
-// WriteTo sends a UDP datagram to the target.
-// The net.Addr parameter is ignored.
-
+// Old Write
 func (c *proxiedConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	print("OldWrite\n")
 	data := make([]byte, 0, len(contextIDZero)+len(p))
@@ -147,68 +144,61 @@ start:
 		return 0, 0, 0, nil, fmt.Errorf("masque: malformed datagram: %w", err)
 	}
 
-	// ---------------------------------------------------------
-	// 1. Prepare OOB Parameters
-	// ---------------------------------------------------------
+	//Setup OOB
 	var layer int
 	var typeVal int
-	// ECN/TOS is usually a single byte, but CMSG alignment often requires 4 bytes padding
 	const dataLen = 1
-
-	// Calculate required space including header alignment
 	reqLen := unix.CmsgSpace(dataLen)
 
+	//IPv4
 	if udpAddr, ok := c.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP.To4() == nil {
 		layer = unix.IPPROTO_IPV6
 		typeVal = unix.IPV6_TCLASS
-	} else {
+	} else { //IPv6
 		layer = unix.IPPROTO_IP
 		typeVal = unix.IP_TOS
 	}
+
 	print(contextID)
-	// Map ContextID to ECN value
-	tosByte := byte(contextID & 0x03) // Safety mask, assuming ID maps directly to ECN
-	//print(tosByte)
 
-	// ---------------------------------------------------------
-	// 2. Write to the EXISTING oob slice (Do not use make!)
-	// ---------------------------------------------------------
-	oobn = 0 // Default return value if we fail to write OOB
+	//Map ContextID <-> ECN
+	tosByte := byte(0)
 
-	// Only write OOB if the caller provided enough buffer space
+	switch contextID {
+	case cIDZero:
+		tosByte = byte(0)
+	case contextIDECT1:
+		tosByte = byte(1)
+	case contextIDECT0:
+		tosByte = byte(2)
+	case contextIDCE:
+		tosByte = byte(3)
+
+	}
+
+	//Write tosByte into provided oob
+	oobn = 0
+
 	if len(oob) >= reqLen {
-		// Create the Cmsghdr at the start of the buffer
 		cmsghdr := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
 		cmsghdr.Level = int32(layer)
 		cmsghdr.Type = int32(typeVal)
 		cmsghdr.SetLen(unix.CmsgLen(dataLen))
-
-		// Calculate offset to data: Start of buffer + Header Length
-		// Standard way to get pointer to data section
 		dataPtr := uintptr(unsafe.Pointer(&oob[0])) + uintptr(unix.CmsgLen(0))
-
-		// Write the single byte of TOS data
 		*(*byte)(unsafe.Pointer(dataPtr)) = tosByte
-		print("T")
 
 		oobn = reqLen
 	}
-
-	// ---------------------------------------------------------
-	// 3. Return correct types
-	// ---------------------------------------------------------
-	// Return values:
-	// n (payload size), oobn (oob size), flags (0), addr, err
-	// IMPORTANT: Cast c.remoteAddr to *net.UDPAddr so quic-go recognizes this method
+	//Retun Msg + OOB
 	return copy(b, data[nHeader:]), oobn, 0, c.remoteAddr.(*net.UDPAddr), nil
 }
 
 func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err error) {
 	print("Write\n")
-	// Default to Context ID 0 (Non-ECT) if no OOB is provided
+
 	var ecn byte
 
-	// 1. Parse OOB for ECN (TOS/Traffic Class)
+	// Parse OOB for ECN
 	if len(oob) > 0 {
 		msgs, err := unix.ParseSocketControlMessage(oob)
 		if err != nil {
@@ -219,7 +209,7 @@ func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err e
 			if (msg.Header.Level == unix.IPPROTO_IP && msg.Header.Type == unix.IP_TOS) ||
 				(msg.Header.Level == unix.IPPROTO_IPV6 && msg.Header.Type == unix.IPV6_TCLASS) {
 				if len(msg.Data) > 0 {
-					// Extract ECN (last 2 bits)
+					// Extract ECN
 					ecn = msg.Data[0] & 0x03
 				}
 				break
@@ -227,17 +217,26 @@ func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err e
 		}
 	}
 
-	// 2. Map ECN (0-3) directly to Context ID (0-3)
-	// We assume the same 1:1 mapping as used in ReadMsgUDP.
-	// 0x00 -> Non-ECT, 0x01 -> ECT(1), 0x02 -> ECT(0), 0x03 -> CE
+	//Map ECN <-> ContextID
+	var contextId uint64 = 0
+	switch ecn {
+	case 0:
+		contextId = cIDZero
+	case 1:
+		contextId = contextIDECT1
+	case 2:
+		contextId = contextIDECT0
+	case 3:
+		contextId = contextIDCE
+	}
+	cId := quicvarint.Append([]byte{}, contextId)
 
-	// 3. Construct Datagram: [ContextID Varint] + [Payload]
-	// Note: Context IDs 0-3 are single-byte varints in QUIC, matching their value.
-	data := make([]byte, 0, 1+len(b))
-	data = quicvarint.Append(data, uint64(ecn))
+	//Construct Datagram
+	data := make([]byte, 0, len(cId)+len(b))
+	data = append(data, cId...)
 	data = append(data, b...)
 
-	// 4. Send
+	//  Send
 	if err := c.str.SendDatagram(data); err != nil {
 		return 0, 0, err
 	}
@@ -245,28 +244,20 @@ func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err e
 	return len(b), len(oob), nil
 }
 
-// ReadFromUDP is a required method for quic-go to recognize this as a UDPConn.
-// It wraps ReadMsgUDP but ignores the OOB data.
 func (c *proxiedConn) ReadFromUDP(b []byte) (n int, addr net.Addr, err error) {
 	n, _, _, addr, err = c.ReadMsgUDP(b, nil)
 	return
 }
 
-// WriteToUDP is a required method for quic-go to recognize this as a UDPConn.
-// It wraps WriteMsgUDP with no OOB data.
 func (c *proxiedConn) WriteToUDP(b []byte, addr net.Addr) (int, error) {
 	n, _, err := c.WriteMsgUDP(b, nil, addr)
 	return n, err
 }
 
-// SetReadBuffer is called by quic-go to optimize OS buffers.
-// Since this is a proxy, we stub it to satisfy the interface.
 func (c *proxiedConn) SetReadBuffer(bytes int) error {
 	return nil
 }
 
-// SetWriteBuffer is called by quic-go to optimize OS buffers.
-// Since this is a proxy, we stub it to satisfy the interface.
 func (c *proxiedConn) SetWriteBuffer(bytes int) error {
 	return nil
 }
@@ -358,32 +349,12 @@ func skipCapsules(str quicvarint.Reader) error {
 
 }
 
-type noopRawConn struct{}
-
-func (noopRawConn) Control(f func(fd uintptr)) error {
-	// We return nil to pretend that any socket option set via Control (like ECN) succeeded.
-	// We do NOT call f() because we don't have a real file descriptor,
-	// and calling it with 0 (stdin) would be dangerous.
-	return nil
-}
-
-func (noopRawConn) Read(f func(fd uintptr) (done bool)) error {
-	return syscall.EOPNOTSUPP
-}
-
-func (noopRawConn) Write(f func(fd uintptr) (done bool)) error {
-	return syscall.EOPNOTSUPP
-}
-
-// var _ quic.OOBCapablePacketConn = &proxiedConn{}
 func (c *proxiedConn) Read(b []byte) (int, error) {
 	n, _, _, _, err := c.ReadMsgUDP(b, nil)
 	return n, err
 }
 
-// Write implements the net.Conn interface.
 func (c *proxiedConn) Write(b []byte) (int, error) {
-	// We pass nil for the address because WriteMsgUDP ignores it for connected/proxied sockets anyway.
 	n, _, err := c.WriteMsgUDP(b, nil, nil)
 	return n, err
 }
