@@ -1,3 +1,6 @@
 coverage.txt
 *.qlog
 *.sqlog
+cmd/client/bridge
+.gitignore
+cmd/proxy/main
