@@ -2,6 +2,7 @@ package masque
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -15,11 +16,6 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 	"golang.org/x/sys/unix"
-)
-
-const (
-	uriTemplateTargetHost = "target_host"
-	uriTemplateTargetPort = "target_port"
 )
 
 const maxUDPPayloadSize = 1500
@@ -37,13 +33,11 @@ func (e proxyEntry) Close() error {
 }
 
 // A Proxy is an RFC 9298 CONNECT-UDP proxy.
-
 type Proxy struct {
-	mx        sync.Mutex
-	closed    bool
-	refCount  sync.WaitGroup // counter for the Go routines spawned in Upgrade
-	closers   map[io.Closer]struct{}
-	ecnConfig ECNState
+	mx       sync.Mutex
+	closed   bool
+	refCount sync.WaitGroup // counter for the Go routines spawned in Upgrade
+	closers  map[io.Closer]struct{}
 }
 
 func errToStatus(err error) int {
@@ -52,8 +46,7 @@ func errToStatus(err error) int {
 		// Consistent with RFC 9209 Section 2.3.1.
 		return http.StatusGatewayTimeout
 	}
-	var dnsError *net.DNSError
-	if errors.As(err, &dnsError) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		// Recommended by RFC 9209 Section 2.3.2.
 		return http.StatusBadGateway
 	}
@@ -87,13 +80,13 @@ func dnsErrorToProxyStatus(proxyStatus *httpsfv.Item, dnsError *net.DNSError) {
 // For more control over the UDP socket, use ProxyConnectedSocket.
 // Applications may add custom header fields to the response header,
 // but MUST NOT call WriteHeader on the http.ResponseWriter.
-func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
-	ecnConfig := ECNState{false, 0, 0, 0}
-	return s.ProxyECN(w, r, ecnConfig)
-
+func (s *Proxy) Proxy(w http.ResponseWriter, r *ProxyRequest) error {
+	return s.ProxyECN(w, r, ECNState{})
 }
 
-func (s *Proxy) ProxyECN(w http.ResponseWriter, r *Request, ecnConfig ECNState) error {
+// ProxyECN is like Proxy, but maps the ECN bits of proxied UDP packets
+// to the Context IDs in ecnConfig (as parsed by ParseProxyRequestECN).
+func (s *Proxy) ProxyECN(w http.ResponseWriter, r *ProxyRequest, ecnConfig ECNState) error {
 	s.mx.Lock()
 	if s.closed {
 		s.mx.Unlock()
@@ -101,7 +94,7 @@ func (s *Proxy) ProxyECN(w http.ResponseWriter, r *Request, ecnConfig ECNState) 
 		return net.ErrClosed
 	}
 	s.mx.Unlock()
-	s.ecnConfig = ecnConfig
+
 	proxyStatus := httpsfv.NewItem(r.Host)
 	// Adds the proxy status to the header.  Returns
 	// the input error, or a new one if serialization fails.
@@ -114,7 +107,7 @@ func (s *Proxy) ProxyECN(w http.ResponseWriter, r *Request, ecnConfig ECNState) 
 			return marshalErr
 		}
 		w.Header().Add("Proxy-Status", proxyStatusVal)
-		if s.ecnConfig.Enabled {
+		if ecnConfig.Enabled {
 			w.Header().Set("Proxy-ECN", "?1")
 		}
 		return err
@@ -122,8 +115,7 @@ func (s *Proxy) ProxyECN(w http.ResponseWriter, r *Request, ecnConfig ECNState) 
 
 	addr, err := net.ResolveUDPAddr("udp", r.Target)
 	if err != nil {
-		var dnsError *net.DNSError
-		if errors.As(err, &dnsError) {
+		if dnsError, ok := errors.AsType[*net.DNSError](err); ok {
 			dnsErrorToProxyStatus(&proxyStatus, dnsError)
 		}
 		err = writeProxyStatus(err)
@@ -133,7 +125,6 @@ func (s *Proxy) ProxyECN(w http.ResponseWriter, r *Request, ecnConfig ECNState) 
 	proxyStatus.Params.Add("next-hop", addr.String())
 
 	conn, err := net.DialUDP("udp", nil, addr)
-
 	if err != nil {
 		proxyStatus.Params.Add("error", "destination_ip_unroutable")
 		err = writeProxyStatus(err)
@@ -146,15 +137,18 @@ func (s *Proxy) ProxyECN(w http.ResponseWriter, r *Request, ecnConfig ECNState) 
 		w.WriteHeader(errToStatus(err))
 		return err
 	}
-	return s.ProxyConnectedSocket(w, r, conn)
+	return s.proxyConnectedSocket(w, conn, ecnConfig)
 }
 
 // ProxyConnectedSocket proxies a request on a connected UDP socket.
 // Applications may add custom header fields such as Proxy-Status
 // to the response header, but MUST NOT call WriteHeader on the
 // http.ResponseWriter. It closes the connection before returning.
+func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *ProxyRequest, conn *net.UDPConn) error {
+	return s.proxyConnectedSocket(w, conn, ECNState{})
+}
 
-func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *net.UDPConn) error {
+func (s *Proxy) proxyConnectedSocket(w http.ResponseWriter, conn *net.UDPConn, ecnConfig ECNState) error {
 	s.mx.Lock()
 	if s.closed {
 		s.mx.Unlock()
@@ -182,14 +176,14 @@ func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *ne
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := s.proxyConnSend(conn, str); err != nil {
+		if err := s.proxyConnSend(conn, str, ecnConfig); err != nil {
 			log.Printf("proxying send side to %s failed: %v", conn.RemoteAddr(), err)
 		}
 		str.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		if err := s.proxyConnReceive(conn, str); err != nil {
+		if err := s.proxyConnReceive(conn, str, ecnConfig); err != nil {
 			s.mx.Lock()
 			closed := s.closed
 			s.mx.Unlock()
@@ -200,7 +194,7 @@ func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *ne
 		str.Close()
 	}()
 	// discard all capsules sent on the request stream
-	if err := skipCapsules(quicvarint.NewReader(str)); err == io.EOF {
+	if err := skipCapsules(str); err == io.EOF {
 		log.Printf("reading from request stream failed: %v", err)
 	}
 	str.Close()
@@ -212,7 +206,7 @@ func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *ne
 	return nil
 }
 
-func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
+func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream, ecnConfig ECNState) error {
 	for {
 		data, err := str.ReceiveDatagram(context.Background())
 		if err != nil {
@@ -227,15 +221,15 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 		}
 		//Map Context-ID to ECN-bits, drop invalid IDs
 		tosByte := 0
-		if s.ecnConfig.Enabled {
+		if ecnConfig.Enabled {
 			switch contextID {
 			case 0:
 				tosByte = 0
-			case s.ecnConfig.ContextIdECT1:
-				tosByte = 2
-			case s.ecnConfig.ContextIdECT0:
+			case ecnConfig.ContextIdECT1:
 				tosByte = 1
-			case s.ecnConfig.ContextIdCE:
+			case ecnConfig.ContextIdECT0:
+				tosByte = 2
+			case ecnConfig.ContextIdCE:
 				tosByte = 3
 			default:
 				log.Printf("dropping data using invalid ContextID (%d)", contextID)
@@ -273,8 +267,7 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 		cmsghdr.Level = int32(layer)
 		cmsghdr.Type = int32(typeVal)
 		cmsghdr.SetLen(unix.CmsgLen(4))
-		dataPtr := uintptr(unsafe.Pointer(&oob[0])) + uintptr(unix.CmsgLen(0))
-		*(*uint32)(unsafe.Pointer(dataPtr)) = uint32(tosByte)
+		binary.NativeEndian.PutUint32(oob[unix.CmsgLen(0):], uint32(tosByte))
 
 		// Send the message using WriteMsqUDP
 		if _, _, err := conn.WriteMsgUDP(data[n:], oob, nil); err != nil {
@@ -283,7 +276,7 @@ func (s *Proxy) proxyConnSend(conn *net.UDPConn, str *http3.Stream) error {
 	}
 }
 
-func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
+func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream, ecnConfig ECNState) error {
 	// Enable ECN reading via SyscallConn.
 	// TODO: Verify Linux support, currently only tested on MacOS
 	if sc, err := conn.SyscallConn(); err == nil {
@@ -348,16 +341,16 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 
 		//Map ECN <-> ContextID
 		var contextId uint64 = 0
-		if s.ecnConfig.Enabled {
+		if ecnConfig.Enabled {
 			switch ecn {
 			case 0:
 				contextId = 0
 			case 1:
-				contextId = s.ecnConfig.ContextIdECT1
+				contextId = ecnConfig.ContextIdECT1
 			case 2:
-				contextId = s.ecnConfig.ContextIdECT0
+				contextId = ecnConfig.ContextIdECT0
 			case 3:
-				contextId = s.ecnConfig.ContextIdCE
+				contextId = ecnConfig.ContextIdCE
 			}
 		}
 		//Convert Contect ID to Quic Variable Length Encoding
@@ -372,7 +365,6 @@ func (s *Proxy) proxyConnReceive(conn *net.UDPConn, str *http3.Stream) error {
 }
 
 // Close closes the proxy, immediately terminating all proxied flows.
-
 func (s *Proxy) Close() error {
 	s.mx.Lock()
 	s.closed = true

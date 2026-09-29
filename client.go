@@ -2,120 +2,49 @@ package masque
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
-	"strconv"
-	"sync"
 
-	"github.com/dunglas/httpsfv"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/yosida95/uritemplate/v3"
+
+	"github.com/dunglas/httpsfv"
 )
 
-// defaultInitialPacketSize is an increased packet size used for the connection to the proxy.
-// This allows tunneling QUIC connections, which themselves have a minimum MTU requirement of 1200 bytes.
-const defaultInitialPacketSize = 1350
-
-// A Client establishes proxied connections to remote hosts, using a UDP proxy.
-// Multiple flows can be proxied via the same connection to the proxy.
-type Client struct {
-	// TLSClientConfig is the TLS client config used when dialing the QUIC connection to the proxy.
-	// It must set the "h3" ALPN.
-	TLSClientConfig *tls.Config
-
-	// QUICConfig is the QUIC config used when dialing the QUIC connection.
-	QUICConfig *quic.Config
-
-	dialOnce   sync.Once
-	dialErr    error
-	conn       *quic.Conn
+// A ClientConn represents a connection to a single proxy server.
+// Multiple proxied connections can be established over a single ClientConn.
+type ClientConn struct {
 	clientConn *http3.ClientConn
 }
 
-// DialAddr dials a proxied connection to a target server.
-// The target address is sent to the proxy, and the DNS resolution is left to the proxy.
-// The target must be given as a host:port.
-func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Template, target string) (net.PacketConn, *http.Response, error) {
-	ecnConfig := ECNState{false, 0, 0, 0}
-	return c.DialAddrECN(ctx, proxyTemplate, target, ecnConfig)
+// NewClientConn creates a client connection using an existing HTTP/3 connection.
+// The HTTP/3 connection and its underlying QUIC connection must have datagrams enabled.
+// The caller owns the HTTP/3 connection and can also use it for ordinary HTTP requests.
+// Closing a [Conn] returned by [ClientConn.Dial] does not close the HTTP/3 connection.
+func NewClientConn(conn *http3.ClientConn) *ClientConn {
+	return &ClientConn{clientConn: conn}
 }
 
-func (c *Client) DialAddrECN(ctx context.Context, proxyTemplate *uritemplate.Template, target string, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
-	host, port, err := net.SplitHostPort(target)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse target: %w", err)
-	}
-	str, err := proxyTemplate.Expand(uritemplate.Values{
-		uriTemplateTargetHost: uritemplate.String(host),
-		uriTemplateTargetPort: uritemplate.String(port),
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
-	}
-	return c.dial(ctx, str, masqueAddr{target}, ecnConfig)
+// Dial dials a proxied connection to a target server over the proxy connection.
+func (c *ClientConn) Dial(req *Request) (*Conn, *http.Response, error) {
+	return c.dial(req, nil)
 }
 
-// Dial dials a proxied connection to a target server.
-func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr) (net.PacketConn, *http.Response, error) {
-	ecnConfig := ECNState{false, 0, 0, 0}
-	return c.DialECN(ctx, proxyTemplate, raddr, ecnConfig)
-}
-func (c *Client) DialECN(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
-	str, err := proxyTemplate.Expand(uritemplate.Values{
-		uriTemplateTargetHost: uritemplate.String(escape(raddr.IP.String())),
-		uriTemplateTargetPort: uritemplate.String(strconv.Itoa(raddr.Port)),
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
+func (c *ClientConn) dial(req *Request, closeConn func() error) (*Conn, *http.Response, error) {
+	httpReq := req.req
+	if httpReq.URL == nil {
+		return nil, nil, errors.New("masque: request URL is nil")
 	}
-	return c.dial(ctx, str, raddr, ecnConfig)
-}
-
-func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Addr, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
-
-	u, err := url.Parse(expandedTemplate)
-	if err != nil {
-		return nil, nil, fmt.Errorf("masque: failed to parse URI: %w", err)
+	if httpReq.Host == "" && httpReq.URL.Host == "" {
+		return nil, nil, errors.New("masque: request needs a host")
 	}
 
-	c.dialOnce.Do(func() {
-		quicConf := c.QUICConfig
-		if quicConf == nil {
-			quicConf = &quic.Config{
-				EnableDatagrams:   true,
-				InitialPacketSize: defaultInitialPacketSize,
-			}
-		}
-		if !quicConf.EnableDatagrams {
-			c.dialErr = errors.New("masque: QUICConfig needs to enable Datagrams")
-			return
-		}
-		tlsConf := c.TLSClientConfig
-
-		if tlsConf == nil {
-			tlsConf = &tls.Config{NextProtos: []string{http3.NextProtoH3}}
-		}
-		conn, err := quic.DialAddr(ctx, u.Host, tlsConf, quicConf)
-		if err != nil {
-			c.dialErr = fmt.Errorf("masque: dialing QUIC connection failed: %w", err)
-			return
-		}
-		c.conn = conn
-		tr := &http3.Transport{EnableDatagrams: true}
-		c.clientConn = tr.NewClientConn(conn)
-	})
-	if c.dialErr != nil {
-		return nil, nil, c.dialErr
-	}
 	select {
-	case <-ctx.Done():
-		return nil, nil, context.Cause(ctx)
+	case <-httpReq.Context().Done():
+		return nil, nil, context.Cause(httpReq.Context())
 	case <-c.clientConn.Context().Done():
 		return nil, nil, context.Cause(c.clientConn.Context())
 	case <-c.clientConn.ReceivedSettings():
@@ -128,30 +57,19 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 		return nil, nil, errors.New("masque: server didn't enable Datagrams")
 	}
 
-	rstr, err := c.clientConn.OpenRequestStream(ctx)
+	rstr, err := c.clientConn.OpenRequestStream(httpReq.Context())
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to open request stream: %w", err)
 	}
-	var httpHeader http.Header
-	if ecnConfig.Enabled {
-		ecnHeaderValue := fmt.Sprintf("?1; ect1=%d; ect0=%d; ce=%d", ecnConfig.ContextIdECT1, ecnConfig.ContextIdECT0, ecnConfig.ContextIdCE)
-		httpHeader = http.Header{
-			http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue},
-			"Proxy-ECN":                 []string{ecnHeaderValue},
-		}
-	} else {
-		httpHeader = http.Header{
-			http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue},
-		}
-	}
 
-	if err := rstr.SendRequestHeader(&http.Request{
-		Method: http.MethodConnect,
-		Proto:  requestProtocol,
-		Host:   u.Host,
-		Header: httpHeader,
-		URL:    u,
-	}); err != nil {
+	var keepStream bool
+	defer func() {
+		if !keepStream {
+			rstr.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+			rstr.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+		}
+	}()
+	if err := rstr.SendRequestHeader(httpReq); err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to send request: %w", err)
 	}
 	// TODO: optimistically return the connection
@@ -163,18 +81,19 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 		return nil, rsp, fmt.Errorf("masque: server responded with %d", rsp.StatusCode)
 	}
 
-	if _, udp := raddr.(*net.UDPAddr); !udp {
-		if udpAddr := nextHopAddr(rsp); udpAddr != nil {
-			raddr = udpAddr
-		}
-	}
-	if rsp.Header.Get("Proxy-ECN") == "?1" && ecnConfig.Enabled {
-		ecnConfig.Enabled = true
+	var raddr net.Addr
+	if udpAddr := nextHopAddr(rsp); udpAddr != nil {
+		raddr = udpAddr
 	} else {
-		ecnConfig.Enabled = false
+		raddr = net.Addr(masqueAddr{req.target})
 	}
 
-	return newProxiedConn(rstr, masqueAddr{c.conn.LocalAddr().String()}, raddr, ecnConfig), rsp, nil
+	// ECN is only used if both the client requested it and the proxy confirmed it.
+	ecnConfig := req.ecn
+	ecnConfig.Enabled = ecnConfig.Enabled && rsp.Header.Get("Proxy-ECN") == "?1"
+
+	keepStream = true
+	return newProxiedConn(rstr, masqueAddr{c.clientConn.LocalAddr().String()}, raddr, closeConn, ecnConfig), rsp, nil
 }
 
 // Extract the Proxy-Status next-hop value as a UDPAddr.
@@ -215,14 +134,4 @@ func nextHopAddr(rsp *http.Response) *net.UDPAddr {
 		return nil
 	}
 	return &net.UDPAddr{IP: ip, Port: portNum}
-}
-
-// Close closes the connection to the proxy.
-// This immediately shuts down all proxied flows.
-func (c *Client) Close() error {
-	c.dialOnce.Do(func() {}) // wait for existing calls to finish
-	if c.conn != nil {
-		return c.conn.CloseWithError(0, "")
-	}
-	return nil
 }

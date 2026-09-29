@@ -45,10 +45,11 @@ var (
 	_ http3Stream = &http3.RequestStream{}
 )
 
-type proxiedConn struct {
+type Conn struct {
 	str        http3Stream
 	localAddr  net.Addr
 	remoteAddr net.Addr
+	closeConn  func() error
 	ecn        ECNState
 
 	closed   atomic.Bool // set when Close is called
@@ -61,20 +62,23 @@ type proxiedConn struct {
 	readDeadlineTimer *time.Timer
 }
 
-var _ net.PacketConn = &proxiedConn{}
+var _ net.PacketConn = &Conn{}
 
-func newProxiedConn(str http3Stream, local, remote net.Addr, ecn ECNState) *proxiedConn {
-	c := &proxiedConn{
+// closeConn is only used for QUIC connections dialed by [Transport.Dial].
+// It is nil for connections created through [Transport.NewClientConn]; callers close those QUIC connections themselves.
+func newProxiedConn(str http3Stream, local, remote net.Addr, closeConn func() error, ecn ECNState) *Conn {
+	c := &Conn{
 		str:        str,
 		localAddr:  local,
 		remoteAddr: remote,
+		closeConn:  closeConn,
 		readDone:   make(chan struct{}),
 		ecn:        ecn,
 	}
 	c.readCtx, c.readCtxCancel = context.WithCancel(context.Background())
 	go func() {
 		defer close(c.readDone)
-		if err := skipCapsules(quicvarint.NewReader(str)); err != io.EOF && !c.closed.Load() {
+		if err := skipCapsules(str); err != io.EOF && !c.closed.Load() {
 			log.Printf("reading from request stream failed: %v", err)
 		}
 		str.Close()
@@ -82,10 +86,8 @@ func newProxiedConn(str http3Stream, local, remote net.Addr, ecn ECNState) *prox
 	return c
 }
 
-// Old Read
-func (c *proxiedConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+func (c *Conn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 start:
-
 	c.deadlineMx.Lock()
 	ctx := c.readCtx
 	c.deadlineMx.Unlock()
@@ -117,15 +119,16 @@ start:
 	return copy(b, data[n:]), c.remoteAddr, nil
 }
 
-// Old Write
-func (c *proxiedConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
+// WriteTo sends a UDP datagram to the target.
+// The net.Addr parameter is ignored.
+func (c *Conn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	data := make([]byte, 0, len(contextIDZero)+len(p))
 	data = append(data, contextIDZero...)
 	data = append(data, p...)
 	return len(p), c.str.SendDatagram(data)
 }
 
-func (c *proxiedConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr net.Addr, err error) {
+func (c *Conn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr net.Addr, err error) {
 start:
 	c.deadlineMx.Lock()
 	ctx := c.readCtx
@@ -195,16 +198,15 @@ start:
 		cmsghdr.Level = int32(layer)
 		cmsghdr.Type = int32(typeVal)
 		cmsghdr.SetLen(unix.CmsgLen(dataLen))
-		dataPtr := uintptr(unsafe.Pointer(&oob[0])) + uintptr(unix.CmsgLen(0))
-		*(*byte)(unsafe.Pointer(dataPtr)) = tosByte
+		oob[unix.CmsgLen(0)] = tosByte
 
 		oobn = reqLen
 	}
 	//Retun Msg + OOB
-	return copy(b, data[nHeader:]), oobn, 0, c.remoteAddr.(*net.UDPAddr), nil
+	return copy(b, data[nHeader:]), oobn, 0, c.remoteAddr, nil
 }
 
-func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err error) {
+func (c *Conn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err error) {
 	var ecn byte
 
 	// Parse OOB for ECN
@@ -214,9 +216,10 @@ func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err e
 			return 0, 0, fmt.Errorf("masque: failed to parse oob: %w", err)
 		}
 		for _, msg := range msgs {
-			// Check for IPv4 TOS or IPv6 Traffic Class
-			if (msg.Header.Level == unix.IPPROTO_IP && msg.Header.Type == unix.IP_TOS) ||
-				(msg.Header.Level == unix.IPPROTO_IPV6 && msg.Header.Type == unix.IPV6_TCLASS) {
+			// Check for IPv4 TOS or IPv6 Traffic Class.
+			// The oob may come straight from a socket read: macOS reports the received TOS as IP_RECVTOS, Linux as IP_TOS.
+			if (msg.Header.Level == unix.IPPROTO_IP && (msg.Header.Type == unix.IP_TOS || msg.Header.Type == unix.IP_RECVTOS)) ||
+				(msg.Header.Level == unix.IPPROTO_IPV6 && (msg.Header.Type == unix.IPV6_TCLASS || msg.Header.Type == unix.IPV6_RECVTCLASS)) {
 				if len(msg.Data) > 0 {
 					// Extract ECN
 					ecn = msg.Data[0] & 0x03
@@ -255,25 +258,25 @@ func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err e
 	return len(b), len(oob), nil
 }
 
-func (c *proxiedConn) ReadFromUDP(b []byte) (n int, addr net.Addr, err error) {
+func (c *Conn) ReadFromUDP(b []byte) (n int, addr net.Addr, err error) {
 	n, _, _, addr, err = c.ReadMsgUDP(b, nil)
 	return
 }
 
-func (c *proxiedConn) WriteToUDP(b []byte, addr net.Addr) (int, error) {
+func (c *Conn) WriteToUDP(b []byte, addr net.Addr) (int, error) {
 	n, _, err := c.WriteMsgUDP(b, nil, addr)
 	return n, err
 }
 
-func (c *proxiedConn) SetReadBuffer(bytes int) error {
+func (c *Conn) SetReadBuffer(bytes int) error {
 	return nil
 }
 
-func (c *proxiedConn) SetWriteBuffer(bytes int) error {
+func (c *Conn) SetWriteBuffer(bytes int) error {
 	return nil
 }
 
-func (c *proxiedConn) Close() error {
+func (c *Conn) Close() error {
 	c.closed.Store(true)
 	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 	err := c.str.Close()
@@ -284,23 +287,26 @@ func (c *proxiedConn) Close() error {
 		c.readDeadlineTimer.Stop()
 	}
 	c.deadlineMx.Unlock()
+	if c.closeConn != nil {
+		return errors.Join(err, c.closeConn())
+	}
 	return err
 }
 
-func (c *proxiedConn) LocalAddr() net.Addr {
+func (c *Conn) LocalAddr() net.Addr {
 	return c.localAddr
 }
 
-func (c *proxiedConn) RemoteAddr() net.Addr {
+func (c *Conn) RemoteAddr() net.Addr {
 	return c.remoteAddr
 }
 
-func (c *proxiedConn) SetDeadline(t time.Time) error {
+func (c *Conn) SetDeadline(t time.Time) error {
 	_ = c.SetWriteDeadline(t)
 	return c.SetReadDeadline(t)
 }
 
-func (c *proxiedConn) SetReadDeadline(t time.Time) error {
+func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.deadlineMx.Lock()
 	defer c.deadlineMx.Unlock()
 
@@ -341,31 +347,31 @@ func (c *proxiedConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *proxiedConn) SetWriteDeadline(time.Time) error {
+func (c *Conn) SetWriteDeadline(time.Time) error {
 	// TODO(#22): This is currently blocked on a change in quic-go's API.
 	return nil
 }
 
-func skipCapsules(str quicvarint.Reader) error {
+func skipCapsules(str io.Reader) error {
+	parser := http3.NewCapsuleParser(str)
 	for {
-		ct, r, err := http3.ParseCapsule(str)
+		ct, r, err := parser.Next()
 		if err != nil {
 			return err
 		}
 		log.Printf("skipping capsule of type %d", ct)
-		if _, err := io.Copy(io.Discard, r); err != nil {
+		if err := r.Discard(); err != nil {
 			return err
 		}
 	}
-
 }
 
-func (c *proxiedConn) Read(b []byte) (int, error) {
+func (c *Conn) Read(b []byte) (int, error) {
 	n, _, _, _, err := c.ReadMsgUDP(b, nil)
 	return n, err
 }
 
-func (c *proxiedConn) Write(b []byte) (int, error) {
+func (c *Conn) Write(b []byte) (int, error) {
 	n, _, err := c.WriteMsgUDP(b, nil, nil)
 	return n, err
 }

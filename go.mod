@@ -1,26 +1,25 @@
 module github.com/quic-go/masque-go
 
-go 1.24
+go 1.26.0
 
 require (
-	github.com/dunglas/httpsfv v1.0.2
-	github.com/quic-go/quic-go v0.57.1
-	github.com/stretchr/testify v1.11.1
+	github.com/dunglas/httpsfv v1.1.0
+	github.com/quic-go/quic-go v0.63.0
+	github.com/spf13/pflag v1.0.10
+	github.com/stretchr/testify v1.12.1
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	go.uber.org/goleak v1.3.0
-	golang.org/x/sys v0.35.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
-	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/kr/text v0.2.0 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/spf13/pflag v1.0.10 // indirect
-	golang.org/x/crypto v0.41.0 // indirect
-	golang.org/x/net v0.43.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 )
 
-replace github.com/quic-go/quic-go => ../quic-go
+// The ECN-enabled quic-go fork (reads ECN via Conn.ReadMsgUDP/WriteMsgUDP) must be
+// rebased onto quic-go v0.63.0 before it can be used here again.
+// replace github.com/quic-go/quic-go => ../quic-go

@@ -64,10 +64,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(u.Path, func(w http.ResponseWriter, r *http.Request) {
-		req, ecnConfig, err := masque.ParseRequestECN(r, template)
+		req, ecnConfig, err := masque.ParseProxyRequestECN(r, template)
 		if err != nil {
-			var perr *masque.RequestParseError
-			if errors.As(err, &perr) {
+			if perr, ok := errors.AsType[*masque.ProxyRequestParseError](err); ok {
 				w.WriteHeader(perr.HTTPStatus)
 				return
 			}

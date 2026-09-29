@@ -24,11 +24,14 @@ func scaleDuration(d time.Duration) time.Duration {
 	return d
 }
 
+// newRequest creates a server-side CONNECT-UDP request.
 func newRequest(target string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	req.Method = http.MethodConnect
 	req.Proto = "connect-udp"
 	req.Header.Add("Capsule-Protocol", "?1")
+	req.URL.Scheme = ""
+	req.URL.Host = ""
 	return req
 }
 
@@ -40,7 +43,7 @@ func TestProxyCloseProxiedConn(t *testing.T) {
 	p := masque.Proxy{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
-		req, err := masque.ParseRequest(r, template)
+		req, err := masque.ParseProxyRequest(r, template)
 		if err != nil {
 			t.Logf("error parsing request: %v", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -67,7 +70,10 @@ func TestProxyCloseProxiedConn(t *testing.T) {
 	require.NoError(t, err)
 
 	targetConn := newUDPConnLocalhost(t)
-	req := newRequest(fmt.Sprintf("https://localhost:%d/masque?h=localhost&p=%d", serverPort, targetConn.LocalAddr().(*net.UDPAddr).Port))
+	req, err := http.NewRequest(http.MethodConnect, fmt.Sprintf("https://localhost:%d/masque?h=localhost&p=%d", serverPort, targetConn.LocalAddr().(*net.UDPAddr).Port), nil)
+	require.NoError(t, err)
+	req.Proto = "connect-udp"
+	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
 	require.NoError(t, reqStr.SendRequestHeader(req))
 	hdr, err := reqStr.ReadResponse()
 	require.NoError(t, err)
@@ -111,7 +117,7 @@ func TestProxyCloseProxiedConn(t *testing.T) {
 func TestProxyBadPort(t *testing.T) {
 	p := masque.Proxy{}
 	r := newRequest("https://localhost:1234/masque?h=localhost&p=70000") // invalid port number
-	req, err := masque.ParseRequest(r, uritemplate.MustNew("https://localhost:1234/masque?h={target_host}&p={target_port}"))
+	req, err := masque.ParseProxyRequest(r, uritemplate.MustNew("https://localhost:1234/masque?h={target_host}&p={target_port}"))
 	require.NoError(t, err)
 	rec := httptest.NewRecorder()
 
@@ -129,7 +135,7 @@ func TestProxyBadPort(t *testing.T) {
 func TestProxyNXDOMAIN(t *testing.T) {
 	p := masque.Proxy{}
 	r := newRequest("https://localhost:1234/masque?h=nxdomain.test&p=12345") // invalid port number
-	req, err := masque.ParseRequest(r, uritemplate.MustNew("https://localhost:1234/masque?h={target_host}&p={target_port}"))
+	req, err := masque.ParseProxyRequest(r, uritemplate.MustNew("https://localhost:1234/masque?h={target_host}&p={target_port}"))
 	require.NoError(t, err)
 	rec := httptest.NewRecorder()
 
@@ -150,7 +156,7 @@ func TestProxyingAfterClose(t *testing.T) {
 	require.NoError(t, p.Close())
 
 	r := newRequest("https://localhost:1234/masque?h=localhost&p=1234")
-	req, err := masque.ParseRequest(r, uritemplate.MustNew("https://localhost:1234/masque?h={target_host}&p={target_port}"))
+	req, err := masque.ParseProxyRequest(r, uritemplate.MustNew("https://localhost:1234/masque?h={target_host}&p={target_port}"))
 	require.NoError(t, err)
 
 	t.Run("proxying", func(t *testing.T) {

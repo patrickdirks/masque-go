@@ -67,8 +67,10 @@ func testProxyToIP(t *testing.T, addr *net.UDPAddr) {
 	defer server.Close()
 	proxy := masque.Proxy{}
 	defer proxy.Close()
+	rawQueryCh := make(chan string, 1)
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
-		req, err := masque.ParseRequest(r, template)
+		rawQueryCh <- r.URL.RawQuery
+		req, err := masque.ParseProxyRequest(r, template)
 		if err != nil {
 			t.Log("Upgrade failed:", err)
 			w.WriteHeader(http.StatusBadRequest)
@@ -82,16 +84,23 @@ func testProxyToIP(t *testing.T, addr *net.UDPAddr) {
 		}
 	}()
 
-	cl := masque.Client{
+	tr := masque.Transport{
 		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
 	}
-	defer cl.Close()
-	proxiedConn, _, err := cl.Dial(
-		context.Background(),
-		template,
-		remoteServerConn.LocalAddr().(*net.UDPAddr),
-	)
+	req, err := masque.NewRequest(context.Background(), template, remoteServerConn.LocalAddr().String())
 	require.NoError(t, err)
+	proxiedConn, _, err := tr.Dial(req)
+	require.NoError(t, err)
+	defer proxiedConn.Close()
+
+	rawQuery := <-rawQueryCh
+	// Verify the client encoded target_host per RFC 9298 (single percent-encoding).
+	require.NotContains(t, rawQuery, "%25", "target_host must not be double percent-encoded")
+	if addr.IP.To4() == nil { // IPv6: colons MUST be percent-encoded, e.g. "::1" -> "%3A%3A1"
+		require.Contains(t, rawQuery, "h=%3A%3A1")
+	} else {
+		require.Contains(t, rawQuery, "h="+addr.IP.String())
+	}
 
 	_, err = proxiedConn.WriteTo([]byte("foobar"), remoteServerConn.LocalAddr())
 	require.NoError(t, err)
@@ -128,7 +137,11 @@ func TestProxyToHostname(t *testing.T) {
 	proxy := masque.Proxy{}
 	defer proxy.Close()
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
-		req, err := masque.ParseRequest(r, template)
+		if r.Header.Get("Authorization") != "Bearer token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		req, err := masque.ParseProxyRequest(r, template)
 		if err != nil {
 			t.Log("Upgrade failed:", err)
 			w.WriteHeader(http.StatusBadRequest)
@@ -151,13 +164,16 @@ func TestProxyToHostname(t *testing.T) {
 		}
 	}()
 
-	cl := masque.Client{
+	tr := masque.Transport{
 		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
 	}
-	defer cl.Close()
-	proxiedConn, rsp, err := cl.DialAddr(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
+	req, err := masque.NewRequest(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
+	require.NoError(t, err)
+	req.Header().Set("Authorization", "Bearer token")
+	proxiedConn, rsp, err := tr.Dial(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, rsp.StatusCode)
+	defer proxiedConn.Close()
 
 	_, err = proxiedConn.WriteTo([]byte("foobar"), nil)
 	require.NoError(t, err)
@@ -196,27 +212,60 @@ func TestProxyingRejected(t *testing.T) {
 		}
 	}()
 
-	cl := masque.Client{
+	tr := masque.Transport{
 		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
 	}
-	defer cl.Close()
-	_, rsp, err := cl.DialAddr(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
+	req, err := masque.NewRequest(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
+	require.NoError(t, err)
+	_, rsp, err := tr.Dial(req)
 	require.Error(t, err)
 	require.Equal(t, http.StatusTeapot, rsp.StatusCode)
 }
 
 func TestProxyToHostnameMissingPort(t *testing.T) {
-	cl := masque.Client{
-		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
-	}
-	defer cl.Close()
-	_, rsp, err := cl.DialAddr(
+	req, err := masque.NewRequest(
 		context.Background(),
 		uritemplate.MustNew("https://localhost:1234/masque?h={target_host}&p={target_port}"),
 		"quic-go.net", // missing port
 	)
-	require.Nil(t, rsp)
+	require.Nil(t, req)
 	require.ErrorContains(t, err, "address quic-go.net: missing port in address")
+}
+
+func TestDialUsesRequestTargetAsRemoteAddr(t *testing.T) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(http3.CapsuleProtocolHeader, "?1")
+		w.WriteHeader(http.StatusOK)
+	})
+	server := http3.Server{
+		TLSConfig:       tlsConf,
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		EnableDatagrams: true,
+		Handler:         mux,
+	}
+	defer server.Close()
+	go func() {
+		if err := server.Serve(conn); err != nil {
+			return
+		}
+	}()
+
+	template := uritemplate.MustNew(fmt.Sprintf("https://localhost:%d/masque?h={target_host}&p={target_port}", conn.LocalAddr().(*net.UDPAddr).Port))
+	req, err := masque.NewRequest(context.Background(), template, "quic-go.net:1234")
+	require.NoError(t, err)
+	tr := masque.Transport{
+		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
+	}
+	proxiedConn, rsp, err := tr.Dial(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rsp.StatusCode)
+	defer proxiedConn.Close()
+	require.Equal(t, "quic-go.net:1234", proxiedConn.RemoteAddr().String())
 }
 
 func TestProxyShutdown(t *testing.T) {
@@ -239,7 +288,7 @@ func TestProxyShutdown(t *testing.T) {
 	defer server.Close()
 	proxy := masque.Proxy{}
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
-		req, err := masque.ParseRequest(r, template)
+		req, err := masque.ParseProxyRequest(r, template)
 		if err != nil {
 			t.Log("Upgrade failed:", err)
 			w.WriteHeader(http.StatusBadRequest)
@@ -253,13 +302,15 @@ func TestProxyShutdown(t *testing.T) {
 		}
 	}()
 
-	cl := masque.Client{
+	tr := masque.Transport{
 		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
 	}
-	defer cl.Close()
-	proxiedConn, rsp, err := cl.Dial(context.Background(), template, remoteServerConn.LocalAddr().(*net.UDPAddr))
+	req, err := masque.NewRequest(context.Background(), template, remoteServerConn.LocalAddr().String())
+	require.NoError(t, err)
+	proxiedConn, rsp, err := tr.Dial(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, rsp.StatusCode)
+	defer proxiedConn.Close()
 
 	_, err = proxiedConn.WriteTo([]byte("foobar"), remoteServerConn.LocalAddr())
 	require.NoError(t, err)
@@ -273,7 +324,7 @@ func TestProxyShutdown(t *testing.T) {
 	_, _, err = proxiedConn.ReadFrom(b)
 	require.Error(t, err)
 	var errored bool
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if _, err := proxiedConn.WriteTo(b, remoteServerConn.LocalAddr()); err != nil {
 			errored = true
 			break

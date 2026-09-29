@@ -64,7 +64,7 @@ func main() {
 		MaxConnectionReceiveWindow: 50 * 1024 * 1024,
 		KeepAlivePeriod:            2 * time.Second,
 	}
-	cl := masque.Client{
+	tr := masque.Transport{
 		QUICConfig: quicConfig,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -85,17 +85,18 @@ func main() {
 
 	//Tunnel
 	log.Printf("Dialing MASQUE proxy using template...")
-	pconn, _, err := cl.DialECN(context.Background(), uritemplate.MustNew(proxyURITemplate), raddr, ecnConfig)
+	req, err := masque.NewRequestECN(context.Background(), uritemplate.MustNew(proxyURITemplate), raddr.String(), ecnConfig)
+	if err != nil {
+		log.Fatal("Creating MASQUE request failed:", err)
+	}
+	pconn, _, err := tr.Dial(req)
 	if err != nil {
 		log.Fatal("Dialing MASQUE failed:", err)
 	}
 	log.Printf("Established MASQUE tunnel to %s", raddr)
 
-	// Check ECN support
-	mc, ok := pconn.(MasqueConn)
-	if !ok {
-		log.Fatal("The returned MASQUE connection does not implement the custom ReadMsgUDP/WriteMsgUDP methods")
-	}
+	// *masque.Conn implements the custom ReadMsgUDP/WriteMsgUDP methods (checked at compile time)
+	var mc MasqueConn = pconn
 
 	// Listen on configured local IP to connect to picoquic
 	parsedIP := net.ParseIP(localIP)
