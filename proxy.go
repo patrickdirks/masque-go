@@ -87,8 +87,13 @@ func dnsErrorToProxyStatus(proxyStatus *httpsfv.Item, dnsError *net.DNSError) {
 // For more control over the UDP socket, use ProxyConnectedSocket.
 // Applications may add custom header fields to the response header,
 // but MUST NOT call WriteHeader on the http.ResponseWriter.
+func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
+	ecnConfig := ECNState{false, 0, 0, 0}
+	return s.ProxyECN(w, r, ecnConfig)
 
-func (s *Proxy) Proxy(w http.ResponseWriter, r *Request, ecnConfig ECNState) error {
+}
+
+func (s *Proxy) ProxyECN(w http.ResponseWriter, r *Request, ecnConfig ECNState) error {
 	s.mx.Lock()
 	if s.closed {
 		s.mx.Unlock()

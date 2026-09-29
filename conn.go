@@ -119,7 +119,6 @@ start:
 
 // Old Write
 func (c *proxiedConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
-	print("OldWrite\n")
 	data := make([]byte, 0, len(contextIDZero)+len(p))
 	data = append(data, contextIDZero...)
 	data = append(data, p...)
@@ -127,7 +126,6 @@ func (c *proxiedConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 }
 
 func (c *proxiedConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr net.Addr, err error) {
-	print("Read\n")
 start:
 	c.deadlineMx.Lock()
 	ctx := c.readCtx
@@ -168,8 +166,6 @@ start:
 		typeVal = unix.IP_TOS
 	}
 
-	print(contextID)
-
 	//Map ContextID <-> ECN
 	tosByte := byte(0)
 	if c.ecn.Enabled {
@@ -209,8 +205,6 @@ start:
 }
 
 func (c *proxiedConn) WriteMsgUDP(b, oob []byte, _ net.Addr) (n, oobn int, err error) {
-	print("Write\n")
-
 	var ecn byte
 
 	// Parse OOB for ECN

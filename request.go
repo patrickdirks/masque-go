@@ -46,7 +46,13 @@ func (e *RequestParseError) Unwrap() error { return e.Err }
 
 // ParseRequest parses a CONNECT-UDP request.
 // The template is the URI template that clients will use to configure this UDP proxy.
-func ParseRequest(r *http.Request, template *uritemplate.Template) (*Request, ECNState, error) {
+func ParseRequest(r *http.Request, template *uritemplate.Template) (*Request, error) {
+	req, _, err := ParseRequestECN(r, template)
+	return req, err
+
+}
+
+func ParseRequestECN(r *http.Request, template *uritemplate.Template) (*Request, ECNState, error) {
 	u, err := url.Parse(template.Raw())
 	if err != nil {
 		return nil, ECNState{}, &RequestParseError{
@@ -122,7 +128,7 @@ func ParseRequest(r *http.Request, template *uritemplate.Template) (*Request, EC
 	if ecnBody := r.Header.Get("Proxy-ECN"); ecnBody != "" {
 		var err error
 		if ecnConfig, err = ParseProxyECN(ecnBody); err != nil {
-
+			// Currently we throw an error if ECNHeader invalid -> Soft-Fail might be better
 			return nil, ECNState{}, &RequestParseError{
 				HTTPStatus: http.StatusBadRequest,
 				Err:        fmt.Errorf("invalid Proxy-ECN header: %w", err),
@@ -155,13 +161,14 @@ func ParseProxyECN(headerValue string) (ECNState, error) {
 
 	// ECN enabled
 	firstPart := strings.TrimSpace(parts[0])
-	if firstPart == "?0" {
+	switch firstPart {
+	case "?0":
 		state.Enabled = false
 		return state, nil
-	} else if firstPart == "?1" {
+	case "?1":
 		state.Enabled = true
-	} else {
-		return state, errors.New("masque: Proxy-ECN header must start with ?1 to enable")
+	default:
+		return state, errors.New("masque: Proxy-ECN header must start with ?0 or ?1")
 	}
 
 	// Parse Parameters
@@ -194,11 +201,30 @@ func ParseProxyECN(headerValue string) (ECNState, error) {
 		}
 	}
 
-	// Validate that we received all IDs
+	// Validate that we received all IDs + valid mapping
 	if state.Enabled {
 		if state.ContextIdECT0 == 0 || state.ContextIdECT1 == 0 || state.ContextIdCE == 0 {
 			return state, errors.New("masque: incomplete ECN parameters provided")
 		}
+		if state.ContextIdECT0%2 != 0 {
+			return state, errors.New("masque: ContextID for ECT0 must be even")
+		}
+		if state.ContextIdECT1%2 != 0 {
+			return state, errors.New("masque: ContextID for ECT1 must be even")
+		}
+		if state.ContextIdCE%2 != 0 {
+			return state, errors.New("masque: ContextID for CE must be even")
+		}
+		if state.ContextIdECT0 == state.ContextIdECT1 {
+			return state, errors.New("masque: ContectID for ECT1 and ECT0 cannot be the same")
+		}
+		if state.ContextIdECT0 == state.ContextIdCE {
+			return state, errors.New("masque: ContectID for ECT0 and CE cannot be the same")
+		}
+		if state.ContextIdCE == state.ContextIdECT1 {
+			return state, errors.New("masque: ContectID for ECT1 and CE cannot be the same")
+		}
+
 	}
 
 	return state, nil

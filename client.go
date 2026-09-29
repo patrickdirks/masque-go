@@ -41,7 +41,12 @@ type Client struct {
 // DialAddr dials a proxied connection to a target server.
 // The target address is sent to the proxy, and the DNS resolution is left to the proxy.
 // The target must be given as a host:port.
-func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Template, target string, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
+func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Template, target string) (net.PacketConn, *http.Response, error) {
+	ecnConfig := ECNState{false, 0, 0, 0}
+	return c.DialAddrECN(ctx, proxyTemplate, target, ecnConfig)
+}
+
+func (c *Client) DialAddrECN(ctx context.Context, proxyTemplate *uritemplate.Template, target string, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse target: %w", err)
@@ -57,7 +62,11 @@ func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Templa
 }
 
 // Dial dials a proxied connection to a target server.
-func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
+func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr) (net.PacketConn, *http.Response, error) {
+	ecnConfig := ECNState{false, 0, 0, 0}
+	return c.DialECN(ctx, proxyTemplate, raddr, ecnConfig)
+}
+func (c *Client) DialECN(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr, ecnConfig ECNState) (net.PacketConn, *http.Response, error) {
 	str, err := proxyTemplate.Expand(uritemplate.Values{
 		uriTemplateTargetHost: uritemplate.String(escape(raddr.IP.String())),
 		uriTemplateTargetPort: uritemplate.String(strconv.Itoa(raddr.Port)),
@@ -159,14 +168,9 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 			raddr = udpAddr
 		}
 	}
-	print("Proxy-ECN Header from server:")
-	print(rsp.Header.Get("Proxy-ECN"))
-	print("\n")
-
 	if rsp.Header.Get("Proxy-ECN") == "?1" && ecnConfig.Enabled {
 		ecnConfig.Enabled = true
 	} else {
-		print("Proxy-ECN not enabled by server")
 		ecnConfig.Enabled = false
 	}
 
